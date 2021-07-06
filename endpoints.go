@@ -4,17 +4,20 @@ import (
 	"encoding/json"
 	redis_lib "github.com/ZhomartZhan/common_lib_hw31"
 	users "github.com/ZhomartZhan/users_hw31"
+	"github.com/djumanoff/amqp"
 	"github.com/google/uuid"
-	"github.com/gorilla/mux"
 	"io/ioutil"
 	"net/http"
 	"time"
 )
 
+const (
+	createUserAmqpEndpoint   = "users.create"
+	getByUsernameAndPassword = "users.getByUsernameAndPassword"
+	getById                  = "users.getById"
+)
+
 type HttpEndpoints interface {
-	TestEndpoint() func(w http.ResponseWriter, r *http.Request)
-	TestEndpointWithParam(idParam string) func(w http.ResponseWriter, r *http.Request)
-	TestPostEndpoint() func(w http.ResponseWriter, r *http.Request)
 	RegisterEndpoint() func(w http.ResponseWriter, r *http.Request)
 	LoginEndpoint() func(w http.ResponseWriter, r *http.Request)
 	ProfileEndpoint() func(w http.ResponseWriter, r *http.Request)
@@ -22,97 +25,12 @@ type HttpEndpoints interface {
 
 type httpEndpoints struct {
 	//variable connection to db
-	usersStore users.UsersStore
-	redisStore *redis_lib.RedisStore
+	amqpConnect amqp.Client
+	redisStore  *redis_lib.RedisConnectStore
 }
 
-func NewHttpEndpoints(uS users.UsersStore, rS *redis_lib.RedisStore) HttpEndpoints {
-	return &httpEndpoints{usersStore: uS, redisStore: rS}
-}
-
-func (h *httpEndpoints) TestEndpoint() func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		user := users.User{
-			Id:        "100513974",
-			Username:  "TestUsername1",
-			Password:  "Qwerty11!",
-			FirstName: "Dana",
-			LastName:  "White",
-			Avatar:    "picture1",
-		}
-		respondJSON(w, http.StatusOK, user)
-		return
-	}
-}
-
-func (h *httpEndpoints) TestEndpointWithParam(idParam string) func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		vars := mux.Vars(r)
-		idStr, ok := vars[idParam]
-		if !ok {
-			respondJSON(w, http.StatusBadRequest, HttpError{
-				Message:    "Dont have user with that id",
-				StatusCode: http.StatusBadRequest,
-			})
-		}
-		var response users.User
-		usersData := []users.User{
-			{
-				Id:        "1",
-				Username:  "Cool_Dude",
-				Password:  "qweasdzxc",
-				FirstName: "Alex",
-				LastName:  "Hopkins",
-				Avatar:    "picture2",
-			},
-			{
-				Id:        "2",
-				Username:  "FeelsBadMan",
-				Password:  "rtyfghvbn",
-				FirstName: "Jack",
-				LastName:  "Smith",
-				Avatar:    "picture3",
-			},
-		}
-		if idStr == "1" {
-			response = usersData[0]
-		} else if idStr == "2" {
-			response = usersData[1]
-		} else {
-			respondJSON(w, http.StatusBadRequest, HttpError{
-				Message:    "Dont have user with that id",
-				StatusCode: http.StatusBadRequest,
-			})
-			return
-		}
-		respondJSON(w, http.StatusOK, response)
-		return
-	}
-}
-
-func (h *httpEndpoints) TestPostEndpoint() func(w http.ResponseWriter, r *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		jsonData, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			respondJSON(w, http.StatusBadRequest, HttpError{
-				Message:    err.Error(),
-				StatusCode: http.StatusBadRequest,
-			})
-			return
-		}
-		user := &users.User{}
-		err = json.Unmarshal(jsonData, &user)
-		if err != nil {
-			respondJSON(w, http.StatusInternalServerError, HttpError{
-				Message:    err.Error(),
-				StatusCode: http.StatusInternalServerError,
-			})
-			return
-		}
-		user.Id = "3333"
-		respondJSON(w, http.StatusCreated, user)
-		return
-	}
+func NewHttpEndpoints(cl amqp.Client, rS *redis_lib.RedisConnectStore) HttpEndpoints {
+	return &httpEndpoints{amqpConnect: cl, redisStore: rS}
 }
 
 func respondJSON(w http.ResponseWriter, status int, payload interface{}) {
@@ -153,22 +71,7 @@ func (h *httpEndpoints) RegisterEndpoint() func(w http.ResponseWriter, r *http.R
 			})
 			return
 		}
-		oldUser, err := h.usersStore.GetByUsernameAndPassword(user.Username, user.Password)
-		if err != nil && err != users.ErrNoUser {
-			respondJSON(w, http.StatusInternalServerError, HttpError{
-				Message:    err.Error(),
-				StatusCode: http.StatusInternalServerError,
-			})
-			return
-		}
-		if oldUser != nil {
-			respondJSON(w, http.StatusBadRequest, HttpError{
-				Message:    ErrUserAlreadyExist.Error(),
-				StatusCode: http.StatusBadRequest,
-			})
-			return
-		}
-		response, err := h.usersStore.Create(user)
+		data, err := h.amqpConnect.Call(createUserAmqpEndpoint, amqp.Message{Body: jsonData})
 		if err != nil {
 			respondJSON(w, http.StatusInternalServerError, HttpError{
 				Message:    err.Error(),
@@ -176,7 +79,16 @@ func (h *httpEndpoints) RegisterEndpoint() func(w http.ResponseWriter, r *http.R
 			})
 			return
 		}
-		respondJSON(w, http.StatusCreated, response)
+		createdUser := &users.User{}
+		err = json.Unmarshal(data.Body, createdUser)
+		if err != nil {
+			respondJSON(w, http.StatusInternalServerError, HttpError{
+				Message:    err.Error(),
+				StatusCode: http.StatusInternalServerError,
+			})
+			return
+		}
+		respondJSON(w, http.StatusCreated, createdUser)
 		return
 	}
 }
@@ -191,8 +103,7 @@ func (h *httpEndpoints) LoginEndpoint() func(w http.ResponseWriter, r *http.Requ
 			})
 			return
 		}
-		req := &LoginRequest{}
-		err = json.Unmarshal(jsonData, &req)
+		data, err := h.amqpConnect.Call(getByUsernameAndPassword, amqp.Message{Body: jsonData})
 		if err != nil {
 			respondJSON(w, http.StatusInternalServerError, HttpError{
 				Message:    err.Error(),
@@ -200,7 +111,8 @@ func (h *httpEndpoints) LoginEndpoint() func(w http.ResponseWriter, r *http.Requ
 			})
 			return
 		}
-		user, err := h.usersStore.GetByUsernameAndPassword(req.Username, req.Password)
+		user := &users.User{}
+		err = json.Unmarshal(data.Body, user)
 		if err != nil {
 			respondJSON(w, http.StatusInternalServerError, HttpError{
 				Message:    err.Error(),
@@ -209,7 +121,7 @@ func (h *httpEndpoints) LoginEndpoint() func(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		key := uuid.New().String()
-		err = h.redisStore.SetValue(key, user, 5*time.Minute)
+		err = h.redisStore.Save(key, user.Id, 5*time.Minute)
 		if err != nil {
 			respondJSON(w, http.StatusInternalServerError, HttpError{
 				Message:    err.Error(),
@@ -227,7 +139,8 @@ func (h *httpEndpoints) ProfileEndpoint() func(w http.ResponseWriter, r *http.Re
 	return func(w http.ResponseWriter, r *http.Request) {
 		contextData := r.Context().Value("user_id")
 		userId := contextData.(string)
-		response, err := h.usersStore.Get(userId)
+		cmd := &users.User{Id: userId}
+		dataJson, err := json.Marshal(cmd)
 		if err != nil {
 			respondJSON(w, http.StatusInternalServerError, HttpError{
 				Message:    err.Error(),
@@ -235,7 +148,24 @@ func (h *httpEndpoints) ProfileEndpoint() func(w http.ResponseWriter, r *http.Re
 			})
 			return
 		}
-		respondJSON(w, http.StatusOK, response)
+		data, err := h.amqpConnect.Call(getById, amqp.Message{Body: dataJson})
+		if err != nil {
+			respondJSON(w, http.StatusInternalServerError, HttpError{
+				Message:    err.Error(),
+				StatusCode: http.StatusInternalServerError,
+			})
+			return
+		}
+		user := &users.User{}
+		err = json.Unmarshal(data.Body, &user)
+		if err != nil {
+			respondJSON(w, http.StatusInternalServerError, HttpError{
+				Message:    err.Error(),
+				StatusCode: http.StatusInternalServerError,
+			})
+			return
+		}
+		respondJSON(w, http.StatusOK, user)
 		return
 	}
 }
